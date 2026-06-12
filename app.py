@@ -242,103 +242,194 @@ if optimize_btn:
         st.warning("Please upload a CSV file or load the sample data first.")
         st.stop()
 
-    # Reset log for this run
     st.session_state["debug_log"] = []
-
-    bar = st.progress(0, text="Preparing coordinates…")
 
     stops_coords = list(zip(df["lat"].astype(float), df["lon"].astype(float)))
     all_coords   = [(depot_lat, depot_lon)] + stops_coords
-    n_stops = len(stops_coords)
-    _log(f"Stops loaded: {n_stops} · Depot: ({depot_lat}, {depot_lon})")
+    n_stops      = len(stops_coords)
+    n_nodes      = n_stops + 1
+    _log(f"Stops: {n_stops} · Depot: ({depot_lat}, {depot_lon})")
 
-    bar.progress(10, f"Requesting {n_stops+1}×{n_stops+1} distance matrix from OSRM…")
-    _log(f"Calling OSRM Table API for {n_stops+1} nodes…")
-    try:
-        dist_matrix = get_distance_matrix(all_coords)
-        _log(f"Distance matrix received: {len(dist_matrix)}×{len(dist_matrix[0])}")
-    except Exception as exc:
-        _log_exc("OSRM Table API", exc)
-        bar.empty()
-        st.error(f"OSRM Table API error: {exc}")
-        st.stop()
-
-    bar.progress(50, f"Solving CVRP for {n_stops} stops (time limit: {time_limit}s)…")
-    _log(f"Running OR-Tools CVRP · capacity={vehicle_cap} · max_km={max_km} · time_limit={time_limit}s")
-    try:
-        result = solve_cvrp(
-            distance_matrix=dist_matrix,
-            num_vehicles=n_stops,
-            vehicle_capacity=vehicle_cap,
-            max_distance_m=max_km * 1000,
-            time_limit_s=time_limit,
+    # ── Step 1: Distance matrix ─────────────────────────────────────────────
+    with st.status(f"📡 Step 1/3 — Fetching real driving distances", expanded=True) as s1:
+        st.markdown(
+            f"Sending **{n_nodes} coordinates** to the OSRM routing engine.  \n"
+            f"A single API call will return a **{n_nodes}×{n_nodes} = {n_nodes**2} distance pairs** matrix "
+            f"(all real driving distances, in metres)."
         )
-    except Exception as exc:
-        _log_exc("OR-Tools solver", exc)
-        bar.empty()
-        st.error(f"Solver crashed: {exc}")
-        st.stop()
+        _log(f"OSRM Table API → {n_nodes}×{n_nodes} matrix ({n_nodes**2} pairs)…")
+        try:
+            dist_matrix = get_distance_matrix(all_coords)
+            _log(f"Matrix received: {len(dist_matrix)}×{len(dist_matrix[0])}")
 
-    _log(f"Solver result: success={result['success']} · routes={result.get('num_routes', 0)}")
+            # Quick stats for the user
+            depot_dists = [dist_matrix[0][i] / 1000 for i in range(1, n_nodes)]
+            avg_d  = round(sum(depot_dists) / len(depot_dists), 1)
+            max_d  = round(max(depot_dists), 1)
+            min_d  = round(min(depot_dists), 1)
+            min_rt = round(min(depot_dists[i] + dist_matrix[i+1][0]/1000 for i in range(n_stops)), 1)
+            max_rt = round(max(depot_dists[i] + dist_matrix[i+1][0]/1000 for i in range(n_stops)), 1)
+            _log(f"Depot distances → min={min_d} km  avg={avg_d} km  max={max_d} km")
+            _log(f"Round-trips     → min={min_rt} km  max={max_rt} km  (limit={max_km} km)")
 
-    if not result["success"]:
-        bar.empty()
+            st.success(
+                f"✅ Matrix ready — {n_nodes}×{n_nodes}  \n"
+                f"Distance from depot: min **{min_d} km** · avg **{avg_d} km** · max **{max_d} km**  \n"
+                f"Shortest round-trip: **{min_rt} km** · Longest: **{max_rt} km**"
+            )
+            s1.update(label=f"✅ Step 1/3 — Distance matrix ({n_nodes}×{n_nodes})", state="complete")
+        except Exception as exc:
+            _log_exc("OSRM", exc)
+            s1.update(label="❌ Step 1/3 — OSRM failed", state="error")
+            st.error(f"OSRM error: {exc}")
+            st.stop()
+
+    # ── Pre-solve feasibility check ─────────────────────────────────────────
+    infeasible = []
+    for i in range(n_stops):
+        rt = (dist_matrix[0][i+1] + dist_matrix[i+1][0]) / 1000
+        if rt > max_km:
+            name = df.iloc[i].get("name", f"Stop {i+1}") if "name" in df.columns else f"Stop {i+1}"
+            infeasible.append({
+                "Stop": str(name),
+                "From depot (km)": round(dist_matrix[0][i+1]/1000, 1),
+                "Return to depot (km)": round(dist_matrix[i+1][0]/1000, 1),
+                "Min round-trip (km)": round(rt, 1),
+            })
+
+    if infeasible:
+        needed_km = max(r["Min round-trip (km)"] for r in infeasible)
+        _log(f"Infeasible stops ({len(infeasible)}): need max_km ≥ {needed_km} km")
         st.error(
-            "No feasible solution found.  "
-            "Try increasing **max route distance**, **stops per vehicle**, or **solver time**."
+            f"**{len(infeasible)} stop(s) cannot be visited** within the current "
+            f"**{max_km} km** route limit — their round-trip from the depot alone exceeds it.  \n"
+            f"👉 Set **Max route distance ≥ {needed_km} km** to make the problem feasible."
+        )
+        st.dataframe(
+            pd.DataFrame(infeasible),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Min round-trip (km)": st.column_config.ProgressColumn(
+                    min_value=0, max_value=needed_km * 1.2, format="%.1f km"
+                )
+            },
         )
         st.stop()
 
-    # Build stop info
+    # ── Step 2: CVRP solver ─────────────────────────────────────────────────
+    min_vehicles = -(-n_stops // vehicle_cap)   # ceiling division
+    with st.status(f"🧮 Step 2/3 — Running CVRP solver (up to {time_limit} s)", expanded=True) as s2:
+        st.markdown(
+            f"**OR-Tools Guided Local Search** is exploring route combinations.  \n"
+            f"Problem: **{n_stops} stops** · **{vehicle_cap} stops/vehicle** · "
+            f"**{max_km} km max/route** · minimum **{min_vehicles} vehicles** needed  \n"
+            f"The solver runs for up to **{time_limit} seconds** and returns the best solution found."
+        )
+        _log(f"OR-Tools CVRP · cap={vehicle_cap} · max_km={max_km} · time={time_limit}s · min_vehicles={min_vehicles}")
+        try:
+            result = solve_cvrp(
+                distance_matrix=dist_matrix,
+                num_vehicles=n_stops,
+                vehicle_capacity=vehicle_cap,
+                max_distance_m=max_km * 1000,
+                time_limit_s=time_limit,
+            )
+        except Exception as exc:
+            _log_exc("OR-Tools", exc)
+            s2.update(label="❌ Step 2/3 — Solver crashed", state="error")
+            st.error(f"Solver crashed: {exc}")
+            st.stop()
+
+        _log(f"Result: success={result['success']} · routes={result.get('num_routes',0)}")
+
+        if not result["success"]:
+            s2.update(label="❌ Step 2/3 — No solution found", state="error")
+            # Show per-stop depot distances as a diagnostic table
+            rows = []
+            for i in range(n_stops):
+                name = df.iloc[i].get("name", f"Stop {i+1}") if "name" in df.columns else f"Stop {i+1}"
+                rt = round((dist_matrix[0][i+1] + dist_matrix[i+1][0]) / 1000, 1)
+                rows.append({"Stop": str(name), "Round-trip (km)": rt})
+            rows.sort(key=lambda r: r["Round-trip (km)"], reverse=True)
+            suggested_km = max(r["Round-trip (km)"] for r in rows)
+            st.error(
+                f"**No feasible solution found** after {time_limit} s.  \n"
+                f"The hardest constraint is usually **max route distance**. "
+                f"For this dataset the longest round-trip is **{suggested_km} km** — "
+                f"try setting max distance to **≥ {int(suggested_km) + 5} km**."
+            )
+            st.dataframe(
+                pd.DataFrame(rows),
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "Round-trip (km)": st.column_config.ProgressColumn(
+                        min_value=0, max_value=suggested_km * 1.1, format="%.1f km"
+                    )
+                },
+            )
+            st.stop()
+
+        s2.update(
+            label=(
+                f"✅ Step 2/3 — Solved: {result['num_routes']} routes · "
+                f"{result['total_distance_km']} km total"
+            ),
+            state="complete",
+        )
+        st.success(
+            f"Found **{result['num_routes']} routes** covering all {n_stops} stops  \n"
+            f"Total driving distance: **{result['total_distance_km']} km**  \n"
+            f"Fleet utilization: **{result['vehicle_utilization']} %**"
+        )
+
+    # ── Build stop info ─────────────────────────────────────────────────────
     stop_info: list[dict] = []
     for i, (_, row) in enumerate(df.iterrows()):
-        stop_info.append(
-            {
-                "id":   str(row.get("id", i + 1)),
-                "name": str(row.get("name", f"Stop {i + 1}")),
-                "lat":  float(row["lat"]),
-                "lon":  float(row["lon"]),
-            }
-        )
+        stop_info.append({
+            "id":   str(row.get("id", i + 1)),
+            "name": str(row.get("name", f"Stop {i + 1}")),
+            "lat":  float(row["lat"]),
+            "lon":  float(row["lon"]),
+        })
 
-    # Fetch road geometry per route
+    # ── Step 3: Road geometry ───────────────────────────────────────────────
     geometries: dict[int, list] = {}
     total_routes = len(result["routes"])
-    _log(f"Fetching road geometry for {total_routes} routes…")
-    for j, route in enumerate(result["routes"]):
-        pct = 70 + int(25 * j / max(total_routes, 1))
-        bar.progress(pct, f"Fetching road geometry — route {j+1}/{total_routes}…")
+    with st.status(f"🗺️ Step 3/3 — Fetching road geometry for {total_routes} routes", expanded=True) as s3:
+        _log(f"Fetching geometry for {total_routes} routes…")
+        for j, route in enumerate(result["routes"]):
+            vid = route["vehicle_id"]
+            st.write(
+                f"Route {j+1}/{total_routes} — {route['num_stops']} stops · "
+                f"{route['distance_km']} km"
+            )
+            waypoints = [(depot_lat, depot_lon)]
+            for idx in route["stops"]:
+                s = stop_info[idx - 1]
+                waypoints.append((s["lat"], s["lon"]))
+            waypoints.append((depot_lat, depot_lon))
 
-        waypoints = [(depot_lat, depot_lon)]
-        for idx in route["stops"]:
-            s = stop_info[idx - 1]
-            waypoints.append((s["lat"], s["lon"]))
-        waypoints.append((depot_lat, depot_lon))
+            time.sleep(0.15)
+            try:
+                geo = get_route_geometry(waypoints)
+                geometries[vid] = geo
+                _log(f"  Route {j+1}: {route['num_stops']} stops · {route['distance_km']} km · {len(geo)} pts")
+            except Exception as exc:
+                _log_exc(f"Route {j+1} geometry", exc)
+                geometries[vid] = waypoints
 
-        time.sleep(0.15)   # be polite to the public OSRM server
-        try:
-            geo = get_route_geometry(waypoints)
-            geometries[route["vehicle_id"]] = geo
-            _log(f"  Route {j+1}: {route['num_stops']} stops · {route['distance_km']} km · {len(geo)} geometry points")
-        except Exception as exc:
-            _log_exc(f"Route {j+1} geometry", exc)
-            geometries[route["vehicle_id"]] = waypoints  # fallback to straight lines
+        _log(f"All done · {result['total_distance_km']} km total · {result['num_routes']} routes")
+        s3.update(label=f"✅ Step 3/3 — Map ready", state="complete")
 
-    _log(f"Done. Total distance: {result['total_distance_km']} km · Routes: {result['num_routes']}")
-    bar.progress(100, "Done!")
-    time.sleep(0.4)
-    bar.empty()
-
-    # Persist to session state
-    st.session_state.update(
-        {
-            "result":     result,
-            "stop_info":  stop_info,
-            "geometries": geometries,
-            "depot":      {"name": depot_name, "lat": depot_lat, "lon": depot_lon},
-            "df":         df,
-        }
-    )
+    # Persist
+    st.session_state.update({
+        "result":     result,
+        "stop_info":  stop_info,
+        "geometries": geometries,
+        "depot":      {"name": depot_name, "lat": depot_lat, "lon": depot_lon},
+        "df":         df,
+    })
 
 # ── Results display ────────────────────────────────────────────────────────────
 if "result" in st.session_state:
