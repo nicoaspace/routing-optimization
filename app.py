@@ -199,8 +199,8 @@ with st.sidebar:
     # 3. Solver parameters
     st.subheader("3 · Parameters")
     vehicle_cap = st.slider("Stops per vehicle (capacity)", 1, 20, 4)
-    max_km      = st.slider("Max route distance (km)", 5, 100, 30)
-    time_limit  = st.slider("Solver time limit (s)", 5, 300, 15, step=5,
+    max_km      = st.slider("Max route distance (km)", 5, 100, 50)
+    time_limit  = st.slider("Solver time limit (s)", 5, 300, 60, step=5,
                             help="Más paradas = más tiempo. Para 50+ paradas prueba 60–120 s.")
 
     st.divider()
