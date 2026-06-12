@@ -1,15 +1,7 @@
-# --- core solver ---
 ortools>=9.11
-numpy>=1.26,<2.0
-
-# --- data ---
 pandas>=2.2
 openpyxl>=3.1
-
-# --- http / routing ---
 requests>=2.31
-
-# --- streamlit app ---
 streamlit>=1.35.0
 folium>=0.17.0
 streamlit-folium>=0.21.0
