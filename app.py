@@ -11,6 +11,7 @@ Stack: OSRM Table API (real road distances) · Google OR-Tools CVRP · Folium
 
 import io
 import time
+import traceback
 
 import folium
 import pandas as pd
@@ -20,6 +21,17 @@ from streamlit_folium import st_folium
 from core.osrm import get_distance_matrix, get_route_geometry
 from core.solver import solve_cvrp
 from viz.map_builder import build_map
+
+
+def _log(msg: str) -> None:
+    """Append a timestamped line to the session-state debug log."""
+    ts = time.strftime("%H:%M:%S")
+    st.session_state.setdefault("debug_log", []).append(f"[{ts}] {msg}")
+
+
+def _log_exc(label: str, exc: Exception) -> None:
+    _log(f"❌ {label}: {exc}")
+    _log(traceback.format_exc())
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -188,7 +200,8 @@ with st.sidebar:
     st.subheader("3 · Parameters")
     vehicle_cap = st.slider("Stops per vehicle (capacity)", 1, 20, 4)
     max_km      = st.slider("Max route distance (km)", 5, 100, 30)
-    time_limit  = st.slider("Solver time limit (s)", 5, 60, 15)
+    time_limit  = st.slider("Solver time limit (s)", 5, 300, 15, step=5,
+                            help="Más paradas = más tiempo. Para 50+ paradas prueba 60–120 s.")
 
     st.divider()
 
@@ -229,29 +242,47 @@ if optimize_btn:
         st.warning("Please upload a CSV file or load the sample data first.")
         st.stop()
 
+    # Reset log for this run
+    st.session_state["debug_log"] = []
+
     bar = st.progress(0, text="Preparing coordinates…")
 
     stops_coords = list(zip(df["lat"].astype(float), df["lon"].astype(float)))
     all_coords   = [(depot_lat, depot_lon)] + stops_coords
     n_stops = len(stops_coords)
+    _log(f"Stops loaded: {n_stops} · Depot: ({depot_lat}, {depot_lon})")
 
     bar.progress(10, f"Requesting {n_stops+1}×{n_stops+1} distance matrix from OSRM…")
+    _log(f"Calling OSRM Table API for {n_stops+1} nodes…")
     try:
         dist_matrix = get_distance_matrix(all_coords)
+        _log(f"Distance matrix received: {len(dist_matrix)}×{len(dist_matrix[0])}")
     except Exception as exc:
+        _log_exc("OSRM Table API", exc)
+        bar.empty()
         st.error(f"OSRM Table API error: {exc}")
         st.stop()
 
     bar.progress(50, f"Solving CVRP for {n_stops} stops (time limit: {time_limit}s)…")
-    result = solve_cvrp(
-        distance_matrix=dist_matrix,
-        num_vehicles=n_stops,          # over-provision; solver uses minimum needed
-        vehicle_capacity=vehicle_cap,
-        max_distance_m=max_km * 1000,
-        time_limit_s=time_limit,
-    )
+    _log(f"Running OR-Tools CVRP · capacity={vehicle_cap} · max_km={max_km} · time_limit={time_limit}s")
+    try:
+        result = solve_cvrp(
+            distance_matrix=dist_matrix,
+            num_vehicles=n_stops,
+            vehicle_capacity=vehicle_cap,
+            max_distance_m=max_km * 1000,
+            time_limit_s=time_limit,
+        )
+    except Exception as exc:
+        _log_exc("OR-Tools solver", exc)
+        bar.empty()
+        st.error(f"Solver crashed: {exc}")
+        st.stop()
+
+    _log(f"Solver result: success={result['success']} · routes={result.get('num_routes', 0)}")
 
     if not result["success"]:
+        bar.empty()
         st.error(
             "No feasible solution found.  "
             "Try increasing **max route distance**, **stops per vehicle**, or **solver time**."
@@ -273,6 +304,7 @@ if optimize_btn:
     # Fetch road geometry per route
     geometries: dict[int, list] = {}
     total_routes = len(result["routes"])
+    _log(f"Fetching road geometry for {total_routes} routes…")
     for j, route in enumerate(result["routes"]):
         pct = 70 + int(25 * j / max(total_routes, 1))
         bar.progress(pct, f"Fetching road geometry — route {j+1}/{total_routes}…")
@@ -284,8 +316,15 @@ if optimize_btn:
         waypoints.append((depot_lat, depot_lon))
 
         time.sleep(0.15)   # be polite to the public OSRM server
-        geometries[route["vehicle_id"]] = get_route_geometry(waypoints)
+        try:
+            geo = get_route_geometry(waypoints)
+            geometries[route["vehicle_id"]] = geo
+            _log(f"  Route {j+1}: {route['num_stops']} stops · {route['distance_km']} km · {len(geo)} geometry points")
+        except Exception as exc:
+            _log_exc(f"Route {j+1} geometry", exc)
+            geometries[route["vehicle_id"]] = waypoints  # fallback to straight lines
 
+    _log(f"Done. Total distance: {result['total_distance_km']} km · Routes: {result['num_routes']}")
     bar.progress(100, "Done!")
     time.sleep(0.4)
     bar.empty()
@@ -434,3 +473,14 @@ else:
         "| 3 | Each optimised route is sent back to OSRM to retrieve real road geometry |\n"
         "| 4 | The map renders colour-coded polylines following actual streets |\n"
     )
+
+# ── Debug log panel ────────────────────────────────────────────────────────────
+if st.session_state.get("debug_log"):
+    with st.expander("🔍 Debug log", expanded=False):
+        st.code("\n".join(st.session_state["debug_log"]), language="text")
+        st.download_button(
+            "⬇️ Download log",
+            "\n".join(st.session_state["debug_log"]).encode(),
+            "debug_log.txt",
+            "text/plain",
+        )
